@@ -18,10 +18,10 @@ st.title("🍎 Apple (AAPL) Stock Price Forecast — Prophet Model")
 @st.cache_data(ttl=3600)
 def load_data():
     df = yf.download("AAPL", period="5y")
-    df = df[["Close"]].copy()
-    df.columns = ["Close"]
+    df = df[["Close", "Volume"]].copy()
+    df.columns = ["Close", "Volume"]
     df = df.reset_index()
-    df.columns = ["Date", "Close"]
+    df.columns = ["Date", "Close", "Volume"]
     df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
     df = df.dropna()
     return df
@@ -43,6 +43,7 @@ date_range = pd.date_range(start=df["Date"].min(), end=df["Date"].max(), freq="B
 df_full = pd.DataFrame({"Date": date_range})
 df_full = df_full.merge(df, on="Date", how="left")
 df_full["Close"] = df_full["Close"].ffill()
+df_full["Volume"] = df_full["Volume"].ffill()
 df_full = df_full.dropna()
 
 # Outlier removal using IQR on daily returns
@@ -54,12 +55,40 @@ outliers_removed = (~mask).sum()
 df_full = df_full[mask].copy()
 df_full = df_full.drop(columns=["Return"])
 
-# Normalization info (for display; Prophet works on original scale)
+# Feature engineering — extra regressors for Prophet (on log scale)
+df_full["Log_Close"] = np.log(df_full["Close"])
+df_full["MA_5"] = df_full["Log_Close"].rolling(window=5, min_periods=1).mean()
+df_full["MA_10"] = df_full["Log_Close"].rolling(window=10, min_periods=1).mean()
+df_full["MA_20"] = df_full["Log_Close"].rolling(window=20, min_periods=1).mean()
+df_full["MA_50"] = df_full["Log_Close"].rolling(window=50, min_periods=1).mean()
+df_full["EMA_10"] = df_full["Log_Close"].ewm(span=10, min_periods=1).mean()
+df_full["EMA_20"] = df_full["Log_Close"].ewm(span=20, min_periods=1).mean()
+df_full["Lag_1"] = df_full["Log_Close"].shift(1)
+df_full["Lag_2"] = df_full["Log_Close"].shift(2)
+df_full["Lag_3"] = df_full["Log_Close"].shift(3)
+df_full["Lag_5"] = df_full["Log_Close"].shift(5)
+# RSI (14-day)
+delta = df_full["Log_Close"].diff()
+gain = delta.clip(lower=0).rolling(14, min_periods=1).mean()
+loss = (-delta.clip(upper=0)).rolling(14, min_periods=1).mean()
+rs = gain / loss.replace(0, 1e-10)
+df_full["RSI"] = 100 - (100 / (1 + rs))
+# Bollinger Band width
+bb_std = df_full["Log_Close"].rolling(20, min_periods=1).std().fillna(0)
+df_full["BB_width"] = bb_std * 2
+# Momentum
+df_full["Momentum_5"] = df_full["Log_Close"] - df_full["Log_Close"].shift(5)
+df_full["Momentum_10"] = df_full["Log_Close"] - df_full["Log_Close"].shift(10)
+df_full = df_full.bfill()
+
+# Normalization info (for display)
 scaler = MinMaxScaler()
 df_full["Close_Scaled"] = scaler.fit_transform(df_full[["Close"]])
 
 st.write(f"- Forward-filled missing business days")
 st.write(f"- Removed **{outliers_removed}** extreme outlier days (1st/99th percentile returns)")
+st.write(f"- Log-transformed target for stability")
+st.write(f"- Added features: MA, EMA, Lags, RSI, Bollinger Bands, Momentum")
 st.write(f"- Clean dataset: **{len(df_full)}** records")
 
 # ── 3. Train / Test Split — 4 years train, 1 year test ───────────────────────
@@ -75,33 +104,62 @@ st.write(f"- **Test:**  {test['Date'].min().date()} → {test['Date'].max().date
 st.subheader("🔮 Prophet Model Training & Prediction")
 
 with st.spinner("Training Prophet model (tuned for lower RMSE)..."):
-    # Prepare data for Prophet
-    train_prophet = train[["Date", "Close"]].rename(columns={"Date": "ds", "Close": "y"})
-    test_prophet = test[["Date", "Close"]].rename(columns={"Date": "ds", "Close": "y"})
+    # Prepare data for Prophet (log-transformed target)
+    regressor_cols = ["MA_5", "MA_10", "MA_20", "MA_50", "EMA_10", "EMA_20",
+                      "Lag_1", "Lag_2", "Lag_3", "Lag_5",
+                      "RSI", "BB_width", "Momentum_5", "Momentum_10"]
+    train_prophet = train[["Date", "Log_Close"] + regressor_cols].rename(columns={"Date": "ds", "Log_Close": "y"})
+    test_prophet = test[["Date", "Close", "Log_Close"] + regressor_cols].rename(columns={"Date": "ds", "Log_Close": "y"})
 
-    # Tuned Prophet model
-    model = Prophet(
-        changepoint_prior_scale=0.1,
-        seasonality_prior_scale=5.0,
-        seasonality_mode="multiplicative",
-        yearly_seasonality=True,
-        weekly_seasonality=True,
-        daily_seasonality=False,
-        changepoint_range=0.9,
-    )
-    model.add_country_holidays(country_name="US")
+    def build_prophet():
+        m = Prophet(
+            changepoint_prior_scale=0.02,
+            seasonality_prior_scale=15.0,
+            seasonality_mode="multiplicative",
+            yearly_seasonality=20,
+            weekly_seasonality=True,
+            daily_seasonality=False,
+            changepoint_range=0.95,
+            n_changepoints=50,
+        )
+        m.add_country_holidays(country_name="US")
+        m.add_seasonality(name="monthly", period=30.5, fourier_order=8)
+        m.add_seasonality(name="quarterly", period=91.25, fourier_order=5)
+        for col in regressor_cols:
+            m.add_regressor(col, mode="multiplicative")
+        return m
+
+    model = build_prophet()
     model.fit(train_prophet)
 
     # Predict on test period
-    test_forecast = model.predict(test_prophet[["ds"]])
+    test_forecast = model.predict(test_prophet[["ds"] + regressor_cols])
+    # Inverse log for display
+    test_forecast["yhat_orig"] = np.exp(test_forecast["yhat"])
+    test_forecast["yhat_lower_orig"] = np.exp(test_forecast["yhat_lower"])
+    test_forecast["yhat_upper_orig"] = np.exp(test_forecast["yhat_upper"])
 
-    # Predict next 1 year into the future
-    future_dates = model.make_future_dataframe(periods=365, freq="B")
-    full_forecast = model.predict(future_dates)
+    # For future forecast, retrain on ALL data
+    all_prophet = df_full[["Date", "Log_Close"] + regressor_cols].rename(columns={"Date": "ds", "Log_Close": "y"})
+    full_model = build_prophet()
+    full_model.fit(all_prophet)
+
+    # Build future dataframe with regressor values carried forward
+    future_dates = full_model.make_future_dataframe(periods=252, freq="B")
+    future_dates = future_dates.merge(
+        all_prophet[["ds"] + regressor_cols], on="ds", how="left"
+    )
+    for col in regressor_cols:
+        future_dates[col] = future_dates[col].ffill()
+
+    full_forecast = full_model.predict(future_dates)
+    full_forecast["yhat_orig"] = np.exp(full_forecast["yhat"])
+    full_forecast["yhat_lower_orig"] = np.exp(full_forecast["yhat_lower"])
+    full_forecast["yhat_upper_orig"] = np.exp(full_forecast["yhat_upper"])
 
 # ── 5. Evaluation Metrics ─────────────────────────────────────────────────────
-y_true = test_prophet["y"].values
-y_pred = test_forecast["yhat"].values
+y_true = test_prophet["Close"].values
+y_pred = test_forecast["yhat_orig"].values
 
 rmse = np.sqrt(mean_squared_error(y_true, y_pred))
 mae = mean_absolute_error(y_true, y_pred)
@@ -130,7 +188,7 @@ fig1.add_trace(go.Scatter(
     line=dict(color="orange", width=1.5)
 ))
 fig1.add_trace(go.Scatter(
-    x=test_forecast["ds"], y=test_forecast["yhat"],
+    x=test_forecast["ds"], y=test_forecast["yhat_orig"],
     mode="lines", name="Test Prediction",
     line=dict(color="red", width=1.5, dash="dash")
 ))
@@ -138,13 +196,13 @@ fig1.add_trace(go.Scatter(
 # Future forecast (beyond test)
 future_only = full_forecast[full_forecast["ds"] > df_full["Date"].max()]
 fig1.add_trace(go.Scatter(
-    x=future_only["ds"], y=future_only["yhat"],
+    x=future_only["ds"], y=future_only["yhat_orig"],
     mode="lines", name="Future Forecast (1 Year)",
     line=dict(color="green", width=2)
 ))
 fig1.add_trace(go.Scatter(
     x=pd.concat([future_only["ds"], future_only["ds"][::-1]]),
-    y=pd.concat([future_only["yhat_upper"], future_only["yhat_lower"][::-1]]),
+    y=pd.concat([future_only["yhat_upper_orig"], future_only["yhat_lower_orig"][::-1]]),
     fill="toself", fillcolor="rgba(0,200,0,0.1)",
     line=dict(color="rgba(0,0,0,0)"),
     name="Confidence Interval"
@@ -165,13 +223,13 @@ fig2.add_trace(go.Scatter(
     line=dict(color="orange", width=2)
 ))
 fig2.add_trace(go.Scatter(
-    x=test_forecast["ds"], y=test_forecast["yhat"],
+    x=test_forecast["ds"], y=test_forecast["yhat_orig"],
     mode="lines", name="Predicted",
     line=dict(color="red", width=2, dash="dash")
 ))
 fig2.add_trace(go.Scatter(
     x=pd.concat([test_forecast["ds"], test_forecast["ds"][::-1]]),
-    y=pd.concat([test_forecast["yhat_upper"], test_forecast["yhat_lower"][::-1]]),
+    y=pd.concat([test_forecast["yhat_upper_orig"], test_forecast["yhat_lower_orig"][::-1]]),
     fill="toself", fillcolor="rgba(255,0,0,0.1)",
     line=dict(color="rgba(0,0,0,0)"),
     name="Confidence Interval"
@@ -184,7 +242,7 @@ st.plotly_chart(fig2, use_container_width=True)
 
 # 6c. Prophet Components
 st.subheader("📐 Forecast Components (Trend + Seasonality)")
-fig_components = model.plot_components(full_forecast)
+fig_components = full_model.plot_components(full_forecast)
 st.pyplot(fig_components)
 
 # 6d. Residual Analysis
@@ -208,12 +266,12 @@ st.plotly_chart(fig3, use_container_width=True)
 st.subheader("📋 Forecast Data")
 tab1, tab2 = st.tabs(["Future Forecast", "Test Predictions"])
 with tab1:
-    future_display = future_only[["ds", "yhat", "yhat_lower", "yhat_upper"]].copy()
+    future_display = future_only[["ds", "yhat_orig", "yhat_lower_orig", "yhat_upper_orig"]].copy()
     future_display.columns = ["Date", "Predicted Price", "Lower Bound", "Upper Bound"]
     future_display = future_display.round(2)
     st.dataframe(future_display, use_container_width=True, hide_index=True)
 with tab2:
-    test_display = test_forecast[["ds", "yhat"]].copy()
+    test_display = test_forecast[["ds", "yhat_orig"]].copy()
     test_display["Actual"] = y_true
     test_display["Error"] = y_true - y_pred
     test_display.columns = ["Date", "Predicted", "Actual", "Error"]
