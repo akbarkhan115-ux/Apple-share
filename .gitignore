@@ -1,0 +1,5 @@
+venv/
+__pycache__/
+*.pyc
+.streamlit/
+apple_price_chart.png
